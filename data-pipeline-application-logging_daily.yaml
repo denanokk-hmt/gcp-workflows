@@ -1,0 +1,504 @@
+#■■■Dailyアプリケーションロギング抽出・集計データパイプライン============================================================
+#::data-pipeline-application-logging-daily
+#
+#■■GCSに蓄積さｓれたApplication logを、集積し、BigQueryへ流し込むためのデータパイプライン
+#   ※FlightBoardがレポートやクエリ、機械学習などに転用できるDWH、DMを生成する
+#   ※本データフローは、想定として新規のログの取り込みであるが、マイグレーション、リカバリーといった運用工数軽減を考慮し、
+#   すべてデータのReplaceを行う機構となっている。しかしBigQueryは基本的に分析基盤のため、UPDATE,DELETEの多用は、出来ない
+#   よって、マイグレーションの場合には、そのBigQueryのDELETE、UPDATEの制約を理解した上で必要最低限とすることが望ましい。
+#
+#■Data flow overview(ETL)
+#   1.[DataLake]:GCS
+#   ↓:E
+#   2.[DWH]:BigQuery
+#   ↓:T
+#   3.[DWH]:BigQuery
+#    ↓L
+#   4.DataMart:Looker
+#
+#■Data flow(simplified detailed)
+#   1.Flow1::GCS to BQ(gcs_logging)
+#       Above 1. to 2.
+#       1.GCS Buckets(Various logs)
+#       ↓::fligth-logbook[Cloud-Run Jobs]
+#       2.BigQuery Tables(dataset:gcs_logging)
+#   2.Flow2::BQ(gcs_logging) to BQ(flightboard)　to BQ(flightboard_contents)
+#       Avobe 2. to 3.
+#       2.BigQuery Tables(dataset:gcs_logging)
+#       ↓::stored proceduers(BigQuery)
+#       3.BigQuery Tables(dataset:flightboard)
+#       ↓
+#   ３.Flow3::BQ(flightboard) to BQ(flightboard_contents)
+#       Avobe 3. to 4.
+#       3.BigQuery Tables(dataset:flightboard_contents)
+#       ↓::stored proceduers(BigQuery)
+#       4.BigQuery Tables(dataset:flightboard_contents)     
+#   ※There are other patterns direct from 1. to 3.
+#
+#■Example Data flow
+#   WhatYa Cockpitで発生したEventログからイベント結果を集計したDailyレポートを表示させる
+#   0.CP
+#   ↓::gyroscope(v2-gyroscope & cloud-run-jobs)
+#   1.GCSバケット(gyrosocpe)
+#   ↓::flight-logbook(cloud-run-jobs) ※multiple server
+#   2.BigQueryテーブル(gcs_logging.gyroscope)
+#   ↓::flightboard.p_extract_gyroscope_365d_client_nd_clients(stored procedure)
+#   3.BigQueryテーブル(flightboard.t_gyroscope_365d_[client])
+#   ↓::flightboard_contents.p_replace_data_agg_some_content_client_nd(stored procedure)
+#   4.BigQueryテーブル(flightboard_contents.t_events_result_30d
+#   ↓::flightboard_contents.tf_events_result_30d(table function-->Looker)
+#   5.CW Dashboard(flithboard v2.0)
+#============================================================
+#■■■MIANワークフロー
+main:
+    params: [args]
+    steps:
+
+    #■■Initialize--------------------------------------------------------------------
+    - init:
+        assign:
+
+            #基本変数の設定を行う---------------------------------------
+            # 1.extract_start_date[string]: (引数指定可能)抽出期間開始日(JST[yyyy-mm-dd]。指定なし=デフォルト値(daily_batch)が入り、この場合、実行日の前日が指定される
+            # 2.extract_end_date[string]:   (引数指定可能)抽出期間終了日(JST[yyyy-mm-dd]。指定なし=デフォルト値(daily_batch)が入り、この場合、実行日の前日が指定される
+            # 3.period[int]:    (引数指定可能)コンテンツ抽出期間(指定なし=デフォルト値(1)が入る
+            #   ※[Dailyバッチを組みたい場合、上記1~3を指定なしで実行すればよい]
+            # 4.project_id[string]:実行GCPプロジェクトIDが自動設定される        
+            - extract_start_date: ${default( map.get(args,"extract_start_date"), "daily_batch")}
+            - extract_end_date: ${default( map.get(args,"extract_end_date"), "daily_batch")}
+            - period: ${default( map.get(args,"period"), 1)}
+            - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+
+            #Flow1変数の設定を行う---------------------------------------
+            # 5.skip_jobs_flow1[bool]:       [ループ検証など]TRUEの場合、CloudRunJobs実行をスキップする        
+            # 6.jobs_location[string]:  CloudRun Jobsが実行されるリージョンを指定する。複数の場合、同じリージョンで作成しておく            
+            # 7.jobs_cleaning_logging_table_contents[Array]: gcs_loggingで指定抽出日期間で削除を行う対象テーブル                        
+            # 8.jobs_name[Array[string]]:   CloudRunJobsのflight-logbookのjob名を指定する 
+            - skip_jobs_flow1: ${default( map.get(args,"skip_jobs_flow1"), "FALSE")}            
+            - jobs_location: europe-west9
+            - jobs_cleaning_logging_table_contents:
+                - flight_record
+                - gyroscope
+                - active_user_counter
+                - tugcar_api_request_logging
+                - chained_tags_logging            
+            - jobs_names: 
+                - sola10fl-flight-logbook
+                - sola10fl-gyroscope
+                
+            #Flow２,3変数の設定を行う---------------------------------------
+            # 9.skip_proc_flow2[bool]: [ループ検証など]TRUEの場合、Flow2のプロシージャ実行をスキップする
+            # 10.skip_proc_flow3[bool]: [ループ検証など]TRUEの場合、Flow３のプロシージャ実行をスキップする            
+            # 11.dataset_flow2[string]:  Flow2で実行するプロシージャが存在するデータセット名
+            # 12.dataset_flow3[string]:  Flow3で実行するプロシージャが存在するデータセット名
+            # 13.procedures[map[string][string][string][[Array]]:　ここですべてのループの軌道をKeyMapで設定している
+            #  階層(1)[map]:実行するプロシージャの種類をキーとして指定、
+            #  └階層(2)[map]:Flow2のプロシージャ名をキーとして指定、
+            #   └階層(3)[map]:Flow3のプロシージャ名をキーとして指定し、[Array]:集計するコンテンツ名を配列として指定
+            #  ※Flowをスキップさせたい場合、プロシージャキー名のキーを"skip_procedure_flow"とすることで自動的にスキップする
+            - skip_proc_flow2: ${default( map.get(args,"skip_proc_flow2"), "FALSE")}
+            - skip_proc_flow3: ${default( map.get(args,"skip_proc_flow3"), "FALSE")}            
+            - dataset_flow2: flightboard
+            - dataset_flow3: flightboard_contents
+            - procedures:
+                flight_record: #flow pattern [1→2→3]
+                    p_f2_1_0_batch_extract_flight_record_365d_client_nd_clients:    
+                        p_f3_0_0_batch_exec_some_content_agg_clients_nd:
+                            - cust_msg
+                            - cust_uuid
+                            - op_connect_leadtime
+                gyrocope: #flow pattern [1→2→3]
+                    p_f2_2_0_batch_extract_gyroscope_365d_client_nd_clients:
+                        p_f3_0_0_batch_exec_some_content_agg_clients_nd:
+                            - pageview
+                            - buttons_events
+                            - events_result       
+                mau_counter: #flow pattern [1→3]
+                    skip_procedure_flow:
+                        p_f3_0_0_batch_exec_some_content_agg_clients_nd:
+                            - mau_counter
+                tugcar_api_request_logging: #flow pattern [1→3]
+                    skip_procedure_flow:
+                        p_f3_0_0_batch_exec_some_content_agg_clients_nd:
+                            - specialtag
+                chained_tags_logging: #flow pattern [1→3]
+                    skip_procedure_flow:
+                        p_f3_0_0_batch_exec_some_content_agg_clients_nd:
+                            - chained_tags_date_of_weekly
+                            - chained_tags_24h
+                            - chained_tags_search_word_1st
+                            - chained_tags_search_word_ranking
+                            - chained_tags_word_chain_user_ranking
+                            - chained_tags_word_chain_ranking
+
+            #結果変数の設定を行う---------------------------------------
+            # 14.job_id[string]:    本Workflowが発行するJobID
+            # 15.results_flow1[Array[string]]:  Flow1Jobs実行結果を格納する
+            # 16.results_flow2[Array[string]]:  Flow2プロシージャ実行結果を格納する
+            # 17.results_flow3[Array[string]]:  Flow3プロシージャ実行結果を格納する
+            - job_id: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}            
+            - results_flow1: {}
+            - results_flow2: {}
+            - results_flow3: {}
+
+    #■■Extract fronGcs---------------------------------------------------------------
+    - extractGcs: 
+        try:
+            #■Data flow:1.----------------------------------------------------------
+            #flight-logbook(CloudRun Jobs)によってGCSからデータ抽出
+            steps:
+
+            #抽出開始日、終了日を登録する
+            - updateExtractDate:
+                steps:
+                    - callProcUpdateExtractDate:
+                        call: googleapis.bigquery.v2.jobs.insert
+                        args:
+                            projectId: ${project_id}
+                            body:
+                                configuration:
+                                    query:
+                                        query: ${"CALL `gcs_logging.p_insert_t_extract_date`(\"" + job_id + "\",\"" + extract_start_date + "\",\"" + extract_end_date + "\");"}
+                                        useLegacySql: false
+                        result: updateResult
+
+                    #プロシージャの結果を出力
+                    - sysLogCallUpdateExtractDateResult:
+                        call: sys.log
+                        args:
+                            text: ${json.encode_to_string(updateResult)}              
+
+            #抽出開始日、終了日が同じレコードを削除
+            - callProcDeleteContent:
+                parallel:
+                    for:
+                        value: content
+                        in: ${jobs_cleaning_logging_table_contents}
+                        steps:
+
+                        #Delete Procをスキップさせる
+                        - skipProcDelete:
+                            switch:
+                                - condition: ${skip_jobs_flow1 == "TRUE"}
+                                  assign:
+                                    - deleteResult: ${"skip delete gcs_logging record:" + content}
+                                  next: sysLogCallDeleteContentResult                         
+
+                        #呼び出すプロシージャcontentを出力
+                        - sysLogCallProcDeleteContent:
+                            call: sys.log
+                            args:
+                                text: ${"Call procedure Delete contents:" + content}
+                                severity: INFO                                                        
+
+                        - runQueryDeleteContent:
+                            call: googleapis.bigquery.v2.jobs.insert
+                            args:
+                                projectId: ${project_id}
+                                body:
+                                    configuration:
+                                        query:
+                                            query: ${"CALL `gcs_logging.p_delete_some_content_import_nd`(\"" + job_id + "\",\"" + content + "\",\"" + extract_start_date + "\",\"" + extract_end_date + "\");"}
+                                            useLegacySql: false
+                            result: deleteResult
+
+                        #プロシージャの結果を出力
+                        - sysLogCallDeleteContentResult:
+                            call: sys.log
+                            args:
+                                text: ${json.encode_to_string(deleteResult)}                                                                                  
+
+            #Cloud Run jobsを実行する
+            - callCloudRunJobsExtractGcs:
+                parallel:
+                    shared: [results_flow1]
+                    for:
+                        value: job
+                        in: ${jobs_names}
+                        steps:
+
+                        #CloudRun Jobsをスキップさせる場合
+                        - skipJobs:
+                            switch:
+                                - condition: ${skip_jobs_flow1 == "TRUE"}
+                                  assign:
+                                    - jobsResult: ${"skip jobs flow1 " + job}                           
+                                  next: sysLogResultCloudRunJobs                        
+
+                        #実行するCloudRun Jobs名を出力
+                        - sysLogCallJobsName:
+                            call: sys.log
+                            args:
+                                text: ${"Call jobs:" + job}
+                                severity: INFO            
+
+                        #Cloud-Run jobs:flight-logbookのJobを実行し、GCSからBQへデータロードを行う
+                        - cloudRunJobs:
+                            call: googleapis.run.v1.namespaces.jobs.run
+                            args:
+                                name: ${"namespaces/" + project_id + "/jobs/" + job}
+                                location: ${jobs_location}
+                            result: jobsResult
+
+                        #CloudRunJobsの結果ログを出力
+                        - sysLogResultCloudRunJobs:
+                            call: sys.log
+                            args:
+                                text: ${jobsResult}
+                                severity: INFO
+
+                        #プロシージャの結果ログを格納
+                        - returnResultFlow1:
+                            assign:
+                                - results_flow1[job]: {}
+                                - results_flow1[job]: ${jobsResult}                              
+
+        #■エラー処理--------------------------------------------------------
+        except:
+            as: e
+            steps:
+                - errorLogFlow1:
+                    call: sys.log
+                    args:
+                        text: ${e}
+                        severity: ERROR
+                - raiseErrorFlow1:
+                    raise: "Flow 1 execution error." 
+
+    #■■Load To BigQuery--------------------------------------------------------------
+    - loadToBq:
+        try:
+            #■Data flow:2.----------------------------------------------------------
+            #予定(変数配列に指定)されたBigQueryのProcedureをパラレル実行する
+            steps:
+            - callProcFlow2:
+                parallel:
+                    shared: [results_flow2, results_flow3]
+                    for:
+                        value: key
+                        in: ${keys(procedures)}
+                        steps:
+
+                        #Flow2のプロシージャ名を取得し、実行する
+                        - execProcFlow2:
+                            for:
+                                value: procFlow2
+                                in: ${keys(procedures[key])}
+                                steps:
+
+                                #[Flow2]プロシージャの実行をスキップさせる
+                                - skipProcFlow2:
+                                    switch:
+                                        - condition: ${skip_proc_flow2 == "TRUE"}
+                                          assign:
+                                            - procedureResultF2: ${"skip procedure flow2:" + procFlow2 + "(" + key + ")"}                                            
+                                          next: sysLogCallProcedureFlow2Result    
+
+                                #Flow2がスキップ対象の場合、Flow３へ移動
+                                - conditionSkipProcFlow2:
+                                    switch:
+                                        - condition: ${procFlow2 == "skip_procedure_flow"}
+                                          next: execProcFlow3
+
+                                #呼び出すプロシージャ名を出力
+                                - sysLogCallProcedureFlow2:
+                                    call: sys.log
+                                    args:
+                                        text: ${"Call procedure flow2:" + procFlow2 + "(" + key + ")"}
+
+                                #サブプロシージャを実行
+                                - runQueryProcFlow2:
+                                    call: SubWF_CallStoredProcedure
+                                    args:
+                                        flow: 2
+                                        project_id: ${project_id}
+                                        dataset: ${dataset_flow2}
+                                        procedure: ${procFlow2}
+                                        job_id: ${job_id}
+                                        job_name: ${procFlow2}
+                                        extract_start_date: ${extract_start_date}
+                                        extract_end_date: ${extract_end_date}
+                                        content: ""
+                                        period: 0
+                                    result: procedureResultF2
+
+                                #プロシージャの結果を出力
+                                - sysLogCallProcedureFlow2Result:
+                                    call: sys.log
+                                    args:
+                                        text: ${json.encode_to_string(procedureResultF2)}  
+
+                                #プロシージャの結果ログを格納
+                                - returnResultFlow2:
+                                    assign:
+                                        - results_flow2[key]: {}
+                                        - results_flow2[key]: ${procedureResultF2}
+
+                                #■Data flow:3.--------------------------------------------------------
+                                #予定(コンテンツ配列に指定)されたBigQueryのコンテンツをパラレル実行する
+                                - execProcFlow3:
+                                    for:
+                                        value: procFlow3
+                                        in: ${keys(procedures[key][procFlow2])}
+                                        steps:
+
+                                        #コンテント毎のループ処理
+                                        - execProcFlow3Contents:             
+                                            parallel:
+                                                shared: [results_flow3]                                            
+                                                for:
+                                                    value: content
+                                                    in: ${procedures[key][procFlow2][procFlow3]}
+                                                    steps:
+
+                                                    #[Flow3]プロシージャの実行をスキップさせる
+                                                    - skipProcFlow3:
+                                                        switch:
+                                                            - condition: ${skip_proc_flow3 == "TRUE"}
+                                                              assign:
+                                                                - procedureResultF3: ${"skip procedure flow3:" + procFlow3 + "(" + content + ")"}
+                                                              next: sysLogCallProcedureFlow3Result                                                    
+
+                                                    #呼び出すプロシージャ名を出力
+                                                    - sysLogCallProcedureFlow3Content:
+                                                        call: sys.log
+                                                        args:
+                                                            text: ${"Call procedure flow3:" + procFlow3 + "(" + content + ")"}
+
+                                                    #サブプロシージャを実行
+                                                    - runQueryProcFlow3Content:
+                                                        call: SubWF_CallStoredProcedure
+                                                        args:
+                                                            flow: 3
+                                                            project_id: ${project_id}
+                                                            dataset: ${dataset_flow3}
+                                                            procedure: ${procFlow3}
+                                                            job_id: ${job_id}
+                                                            job_name: ${content}
+                                                            extract_start_date: ${extract_start_date}
+                                                            extract_end_date: ${extract_end_date}
+                                                            content: ${content}
+                                                            period: ${period}
+                                                        result: procedureResultF3
+                                                    #プロシージャの結果を出力
+                                                    - sysLogCallProcedureFlow3Result:
+                                                        call: sys.log
+                                                        args:
+                                                            text: ${json.encode_to_string(procedureResultF3)}   
+
+                                                    #プロシージャの結果ログを格納
+                                                    - returnResultFlow3:
+                                                        assign:
+                                                            - results_flow3[key]: {}
+                                                            - results_flow3[key]: ${procedureResultF3}
+
+            #Flow2, Flow3のプロシージャ実行結果をマップ
+            - createResultsMap:
+                assign:
+                    - resultsMap:
+                        flow2: ${results_flow2}
+                        flow3: ${results_flow3}
+            #終了結果
+            - finish:
+                return: ${json.encode_to_string(resultsMap)}
+
+        #■リトライ--------------------------------------------------------
+        retry:
+            predicate: ${retry_decision}
+            max_retries: 0
+            backoff:
+                initial_delay: 30
+                max_delay: 300
+                multiplier: 2
+
+        #■エラー処理--------------------------------------------------------
+        except:
+            as: e
+            steps:
+                - errorLogFlow23:
+                    call: sys.log
+                    args:
+                        text: ${e}
+                        severity: ERROR
+                - raiseErrorFlow23:
+                    raise: "Flow2 or Flow3 Procedure execution error."            
+
+#■■任意のエラーでリトライ判定（エラー処理によってわけない)           
+retry_decision:
+  params: [e]
+  steps:
+    - do_repeat:
+        return: true
+
+#============================================================
+#■■■Subワークフロー
+#BiguryのストアドプロシージャをCallする
+#Flow2とFlow3では、引数が異なる
+#[Args]:
+# --プロシージャのCall先指定--
+#   1.flow:Flow2=2, Flow3=3　を指定 
+#   2.project_id:　GCPプロジェクトID
+#   3.dataset: 実行するプロシージャが存在するデータセット(initで指定)
+#   4.procedure: 実行されるプロシージャ名
+#--実行されるプロシージャが利用する引数
+#   5.job_id:本WorkflowのjobID
+#   6.job_name:本WorkflowのjobName
+#   7.extract_start_date:抽出期間開始日(default:"daily_batch")
+#   8.extract_end_date:抽出期間終了日(default:"daily_batch")
+#   9.content:集計を行うコンテント
+#   10.period:集計期間（default:1)
+#============================================================
+SubWF_CallStoredProcedure:
+    params: [flow, project_id, dataset, procedure, job_id, job_name, extract_start_date, extract_end_date, content, period]
+    steps:
+
+    #引数flowに応じて、Flow2向け、Flow3向けのプロシージャをCall（引数の違い)
+    - condition_flow:
+        switch:
+            #Flow2の場合
+            - condition: ${flow == 2}
+              steps:
+                #Flow2のプロシージャを実行する
+                - runQuery_flow2:
+                    call: googleapis.bigquery.v2.jobs.insert
+                    args:
+                        projectId: ${project_id}
+                        body:
+                            configuration:
+                                query:
+                                    query: ${"CALL `" + dataset + "." + procedure + "`(\"" + job_id + "\",\"" + job_name + "\",\"" + extract_start_date + "\",\"" + extract_end_date + "\");"}
+                                    useLegacySql: false
+                        connector_params: 
+                            #タイムアウト：20時間
+                            timeout: 72000                           
+                    result: procedureResult
+
+            #Flow3の場合
+            - condition: ${flow == 3}
+              steps:
+                #Flow3のプロシージャを実行する
+                - runQuery_flow3:
+                    call: googleapis.bigquery.v2.jobs.insert
+                    args:
+                        projectId: ${project_id}
+                        body:
+                            configuration:
+                                query:
+                                    query: ${"CALL `" + dataset + "." + procedure + "`(\"" + job_id + "\",\"" + job_name + "\",\"" + content + "\",\"" + extract_start_date + "\",\"" + extract_end_date + "\"," + period + ");"}
+                                    useLegacySql: false
+                        connector_params: 
+                            #タイムアウト：20時間
+                            timeout: 72000
+                    result: procedureResult
+
+#    #プロシージャの結果を出力
+#    - sys_log_result_procedure:
+#        call: sys.log
+#        args:
+#            text: ${json.encode_to_string(procedureResult)}
+
+    #プロシージャの結果を返却
+    - returnResult:
+        return: ${procedureResult}
+
+
